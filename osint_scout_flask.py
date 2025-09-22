@@ -1,17 +1,7 @@
-# OSINT Scout — Flask web app (with Basic Auth)
-# Deploy-ready for Render.com
-#
-# Quick local run:
-#   pip install -r requirements.txt
-#   python osint_scout_flask.py
-# Then open http://localhost:5000
-#
-# Render deploy (gunicorn, $PORT binding) is handled by Procfile/render.yaml.
-# Set env vars on Render:
-#   APP_USER=<username>
-#   APP_PASS=<password>
+# OSINT Scout - Flask web app (with Basic Auth) - v2
+# Supports "Build Pivots" with ANY single field.
 
-from flask import Flask, render_template_string, request, jsonify, abort, Response
+from flask import Flask, render_template_string, request, jsonify, Response
 import requests
 from PIL import Image, ExifTags
 from io import BytesIO
@@ -23,7 +13,7 @@ from functools import wraps
 
 app = Flask(__name__)
 
-# ----- Basic Auth (set APP_USER and APP_PASS env vars on Render) -----
+# ----- Basic Auth -----
 APP_USER = os.getenv("APP_USER")
 APP_PASS = os.getenv("APP_PASS")
 
@@ -75,17 +65,26 @@ IP_LINKS = [
 ]
 
 EMAIL_LINKS = [
+    ("Google", "https://www.google.com/search?q={q}"),
+    ("Bing", "https://www.bing.com/search?q={q}"),
+    ("DuckDuckGo", "https://duckduckgo.com/?q={q}"),
     ("HaveIBeenPwned", "https://haveibeenpwned.com/"),
     ("Gravatar", "https://en.gravatar.com/site/check/{e}"),
+    ("GitHub code search", "https://github.com/search?q={q}"),
+    ("Pastebin search", "https://pastebin.com/search?q={q}"),
 ]
 
 PHONE_LINKS = [
+    ("Google", "https://www.google.com/search?q={q}"),
+    ("Bing", "https://www.bing.com/search?q={q}"),
+    ("DuckDuckGo", "https://duckduckgo.com/?q={q}"),
     ("WhoCallsMe", "https://whocallsme.com/Phone-Number.aspx/{p}"),
+    ("800notes", "https://800notes.com/Phone.aspx/{p}"),
 ]
 
 # ----- Helpers -----
 def normalize_phone(raw: str) -> str:
-    digits = re.sub(r"\D+", "", raw or "")
+    digits = re.sub(r"\\D+", "", raw or "")
     if not digits:
         return ""
     if digits.startswith("1") and len(digits) == 11:
@@ -113,10 +112,13 @@ def exif_from_bytes(data: bytes):
         exif = img.getexif()
         if not exif:
             return {}
-        from PIL import ExifTags
         return {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
     except Exception:
         return {}
+
+def g(q: str) -> str:
+    import urllib.parse
+    return f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
 
 # ----- Template -----
 INDEX_HTML = '''
@@ -148,7 +150,8 @@ INDEX_HTML = '''
           <div class="mb-2"><input class="form-control" id="phone" placeholder="Phone"></div>
           <div class="mb-2"><input class="form-control" id="domain" placeholder="Domain"></div>
           <div class="mb-2"><input class="form-control" id="ip" placeholder="IP"></div>
-          <div class="mb-2">
+          <div class="mb-2 d-flex gap-2">
+            <button type="button" id="build-pivots" class="btn btn-success btn-sm">Build Pivots</button>
             <button type="button" id="check-username" class="btn btn-primary btn-sm">Check Username (HTTP)</button>
             <button type="button" id="exif-upload-btn" class="btn btn-secondary btn-sm">Upload Image (EXIF)</button>
           </div>
@@ -160,131 +163,89 @@ INDEX_HTML = '''
         </div>
       </div>
     </form>
-
-    <hr>
-    <div class="d-flex justify-content-between">
-      <div>
-        <button class="btn btn-outline-success" id="export-report">Export JSON Report</button>
-      </div>
-      <div class="text-muted">For lawful, internal use only.</div>
-    </div>
   </div>
-
   <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
   <script>
     const results = document.getElementById('results')
-    document.getElementById('check-username').onclick = async () => {
-      const u = document.getElementById('username').value.trim();
-      if(!u){alert('Enter a username');return}
-      results.innerHTML = '<div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div> Checking...'
-      try{
-        const r = await axios.post('/api/check_username', {username: u})
-        renderUsernameResults(r.data)
-      }catch(e){results.innerText = 'Error: '+(e.message||e)}
-    }
-
-    function renderUsernameResults(data){
-      let html = '<h6>Username check</h6>'
-      html += '<ul>'
-      for(const it of data.results){
-        html += `<li><strong>${it.site}</strong>: <a href='${it.url}' target='_blank'>${it.url}</a> — ${it.status || 'link'}`
-        if(it.final_url && it.final_url!=it.url) html += ` → <small>${it.final_url}</small>`
-        html += '</li>'
-      }
-      html += '</ul>'
-      results.innerHTML = html
-    }
-
-    // EXIF upload
-    document.getElementById('exif-upload-btn').onclick = () => document.getElementById('imgfile').click()
-    document.getElementById('imgfile').onchange = async (e)=>{
-      const f = e.target.files[0]
-      if(!f) return
-      const form = new FormData(); form.append('file', f)
-      results.innerHTML = 'Reading image...'
-      const r = await axios.post('/api/exif', form, {headers: {'Content-Type': 'multipart/form-data'}})
-      let html = '<h6>EXIF</h6>'
-      if(r.data.exif && Object.keys(r.data.exif).length){
-        html += '<ul>'
-        for(const k in r.data.exif){ html += `<li><strong>${k}</strong>: ${r.data.exif[k]}</li>` }
-        html += '</ul>'
-      } else html += '<div class="text-muted">No EXIF found</div>'
-      results.innerHTML = html
-    }
-
-    // Export report
-    document.getElementById('export-report').onclick = async ()=>{
+    document.getElementById('build-pivots').onclick = async () => {
       const payload = {
-        name: document.getElementById('name').value,
-        city: document.getElementById('city').value,
-        state: document.getElementById('state').value,
-        username: document.getElementById('username').value,
-        email: document.getElementById('email').value,
-        phone: document.getElementById('phone').value,
-        domain: document.getElementById('domain').value,
-        ip: document.getElementById('ip').value,
+        name: document.getElementById('name').value.trim(),
+        city: document.getElementById('city').value.trim(),
+        state: document.getElementById('state').value.trim(),
+        username: document.getElementById('username').value.trim(),
+        email: document.getElementById('email').value.trim(),
+        phone: document.getElementById('phone').value.trim(),
+        domain: document.getElementById('domain').value.trim(),
+        ip: document.getElementById('ip').value.trim(),
       }
-      const r = await axios.post('/api/report', payload)
-      const blob = new Blob([JSON.stringify(r.data, null, 2)], {type: 'application/json'})
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a'); a.href = url; a.download = 'osint_report.json'; a.click(); URL.revokeObjectURL(url)
+      if(!Object.values(payload).some(v=>v)){ alert('Enter at least one field'); return }
+      results.innerHTML = 'Building search pivots...'
+      const r = await axios.post('/api/pivots', payload)
+      let html = ''
+      for(const section of r.data.sections){
+        html += `<h6 class="mt-3">${section.title}</h6><ul>`
+        for(const item of section.items){
+          html += `<li><a href="${item.url}" target="_blank">${item.label}</a></li>`
+        }
+        html += '</ul>'
+      }
+      results.innerHTML = html
     }
   </script>
   </body>
 </html>
 '''
 
-# ----- Routes -----
 @app.route('/')
 @require_basic_auth
 def index():
     return render_template_string(INDEX_HTML)
 
-@app.route('/api/check_username', methods=['POST'])
+@app.route('/api/pivots', methods=['POST'])
 @require_basic_auth
-def api_check_username():
+def api_pivots():
     data = request.get_json() or {}
-    u = data.get('username', '').strip()
-    if not u:
-        return jsonify({'error': 'username required'}), 400
-    results = []
-    for site, tmpl in USERNAME_SITES:
-        url = tmpl.format(u=u)
-        status = 'link'
-        final = ''
-        info = http_check(url)
-        if 'error' in info:
-            status = 'error'
-            final = info['error'][:200]
-        else:
-            status = f"HTTP {info.get('status_code')}"
-            final = info.get('final_url')
-        results.append({'site': site, 'url': url, 'status': status, 'final_url': final})
-        time.sleep(NET_DELAY)
-    return jsonify({'results': results})
+    sections = []
 
-@app.route('/api/exif', methods=['POST'])
-@require_basic_auth
-def api_exif():
-    if 'file' not in request.files:
-        return jsonify({'error': 'file missing'}), 400
-    f = request.files['file']
-    data = f.read()
-    exif = exif_from_bytes(data)
-    return jsonify({'exif': exif})
+    def add_section(title, items):
+        if items:
+            sections.append({"title": title, "items": items})
 
-@app.route('/api/report', methods=['POST'])
-@require_basic_auth
-def api_report():
-    payload = request.get_json() or {}
-    report = {
-        'generated_at': datetime.utcnow().isoformat(),
-        'inputs': payload,
-        'notes': 'Exported from OSINT Scout — Flask web app',
-    }
-    return jsonify(report)
+    name = data.get('name', '').strip()
+    if name:
+        items = [{"label": "Google Search", "url": g(name)}]
+        add_section("People", items)
+
+    username = data.get('username', '').strip()
+    if username:
+        items = [{"label": s, "url": tmpl.format(u=username)} for s, tmpl in USERNAME_SITES]
+        add_section("Username", items)
+
+    email = data.get('email', '').strip()
+    if email:
+        q = f'"{email}"'
+        items = [{"label": l, "url": t.format(q=q, e=email)} if "{q}" in t or "{e}" in t else {"label": l, "url": t} for l,t in EMAIL_LINKS]
+        add_section("Email", items)
+
+    phone = data.get('phone', '').strip()
+    if phone:
+        norm = normalize_phone(phone)
+        items = [{"label": l, "url": t.format(q=phone, p=norm)} if "{q}" in t or "{p}" in t else {"label": l, "url": t} for l,t in PHONE_LINKS]
+        add_section("Phone", items)
+
+    domain = data.get('domain', '').strip()
+    if domain:
+        items = [{"label": l, "url": t.format(t=domain)} for l,t in DOMAIN_LINKS]
+        add_section("Domain", items)
+
+    ip = data.get('ip', '').strip()
+    if ip:
+        items = [{"label": l, "url": t.format(t=ip)} for l,t in IP_LINKS]
+        add_section("IP", items)
+
+    return jsonify({"sections": sections})
 
 if __name__ == '__main__':
-    # Local dev only (Render uses gunicorn/Procfile)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
