@@ -1,9 +1,10 @@
 # osint_scout_flask.py
-# OSINT Scout — Flask web app (v3.1)
-# - Family Tree pivots (Ancestry, FamilySearch, MyHeritage, Find a Grave, Newspapers.com, people-finders*)
-# - Google dorks (name, username, email, phone, domain, IP, family/obits)
+# OSINT Scout — Flask web app (v3.3)
+# - Family Tree pivots (Ancestry, Find a Grave, Whitepages, FamilyTreeNow)
+# - Removed per request: MyHeritage, Newspapers.com, FamilySearch, TruePeopleSearch, Spokeo
+# - Google dorks (name, username, email, phone, domain, IP, family/obits) updated to remove FamilySearch/Newspapers dorks and add FamilyTreeNow dork
 # - IP pivots include CentralOps Domain Dossier
-# - Username HTTP check, Image EXIF, JSON report export
+# - Username HTTP check, Image EXIF (JPEG + HEIC), JSON report export
 # - Optional Basic Auth: set APP_USER and APP_PASS in your environment (e.g., on Render)
 
 from flask import Flask, render_template_string, request, jsonify, Response
@@ -16,6 +17,13 @@ from datetime import datetime
 import os
 from functools import wraps
 import urllib.parse
+
+# Enable HEIC/HEIF via pillow-heif if available
+try:
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
 
 app = Flask(__name__)
 
@@ -89,16 +97,114 @@ PHONE_LINKS = [
     ("800notes", "https://800notes.com/Phone.aspx/{p}"),
 ]
 
+# ---------- Helpers ----------
+def _q(s: str) -> str:
+    return urllib.parse.quote_plus(s or "")
+
+def _dash_name(full_name: str) -> str:
+    return re.sub(r"\s+", "-", (full_name or "").strip())
+
+def _split_first_last(name: str, surname: str):
+    """Best-effort split for FamilyTreeNow URL parameters."""
+    first = ""
+    last = surname.strip() if surname else ""
+    toks = [t for t in (name or "").strip().split() if t]
+    if toks:
+        first = toks[0]
+        if not last and len(toks) >= 2:
+            last = toks[-1]
+    return first, last
+
+def normalize_phone(raw: str) -> str:
+    digits = re.sub(r"\D+", "", raw or "")
+    if not digits:
+        return ""
+    if digits.startswith("1") and len(digits) == 11:
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    return "+" + digits
+
+def http_check(url: str):
+    try:
+        resp = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=HTTP_TIMEOUT)
+        code = resp.status_code
+        final = resp.url
+        if code >= 400 or code in (403, 405):
+            resp = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=HTTP_TIMEOUT)
+            code = resp.status_code
+            final = resp.url
+        return {"status_code": code, "final_url": final}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _decode_exif_value(v):
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "ignore")
+        except Exception:
+            return repr(v)
+    return v
+
+def _gps_to_decimal(gps):
+    def _to_deg(val):
+        d = val[0][0] / val[0][1]
+        m = val[1][0] / val[1][1]
+        s = val[2][0] / val[2][1]
+        return d + (m / 60.0) + (s / 3600.0)
+    lat = lon = None
+    lat_ref = gps.get("GPSLatitudeRef")
+    lon_ref = gps.get("GPSLongitudeRef")
+    lat_raw = gps.get("GPSLatitude")
+    lon_raw = gps.get("GPSLongitude")
+    if lat_raw and lon_raw:
+        try:
+            lat = _to_deg(lat_raw)
+            lon = _to_deg(lon_raw)
+            if lat_ref in ("S", b"S"):
+                lat = -lat
+            if lon_ref in ("W", b"W"):
+                lon = -lon
+        except Exception:
+            pass
+    return lat, lon
+
+def exif_from_bytes(data: bytes):
+    img = Image.open(BytesIO(data))
+    meta = {
+        "format": img.format,
+        "size": f"{img.size[0]}x{img.size[1]}",
+        "mode": img.mode,
+    }
+    exif_out = {}
+    try:
+        exif = img.getexif()
+    except Exception:
+        exif = None
+    if exif:
+        for k, v in exif.items():
+            tag = ExifTags.TAGS.get(k, k)
+            exif_out[tag] = _decode_exif_value(v)
+        gps_raw = exif.get(34853)  # GPSInfo
+        if gps_raw:
+            gps_named = {}
+            for gk, gv in gps_raw.items():
+                gps_named[ExifTags.GPSTAGS.get(gk, gk)] = gv
+            exif_out["GPSInfo"] = gps_named
+            lat, lon = _gps_to_decimal(gps_named)
+            if lat is not None and lon is not None:
+                exif_out["GPSDecimal"] = {"lat": lat, "lon": lon}
+    return meta, exif_out
+
+def g(q: str) -> str:
+    return f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
+
 # ---------- Family tree / genealogy pivots ----------
 FAMILY_SITES = [
     ("Ancestry (search)", "https://www.ancestry.com/search/?name={name_q}&birth={by}&death={dy}&keywords={kw}"),
-    ("FamilySearch (search)", "https://www.familysearch.org/en/search/record/results?q.givenName={name_q}&q.surname={surname_q}&q.birthLikeDate.from={by}&q.deathLikeDate.from={dy}"),
-    ("MyHeritage (search)", "https://www.myheritage.com/research?s=1&formId=master&formMode=1&action=person&firstName={name_q}&lastName={surname_q}&birthYear={by}&deathYear={dy}"),
     ("Find a Grave (search)", "https://www.findagrave.com/memorial/search?firstname={name_q}&lastname={surname_q}&birthyear={by}&deathyear={dy}"),
-    ("Newspapers.com (search)", "https://www.newspapers.com/search/?query={name_q}%20{surname_q}%20{city}%20{state}%20{by}%20{dy}"),
+    ("FamilyTreeNow (people)", "https://www.familytreenow.com/search/people?first={first}&last={last}&citystatezip={city}%20{state}"),
     ("Whitepages*", "https://www.whitepages.com/name/{name_dash}/{state}"),
-    ("TruePeopleSearch*", "https://www.truepeoplesearch.com/results?name={name_q}%20{surname_q}&citystatezip={city}%20{state}"),
-    ("Spokeo*", "https://www.spokeo.com/{name_dash}/{state}"),
 ]
 
 # ---------- Google dorks ----------
@@ -139,59 +245,16 @@ GOOGLE_DORKS = {
         '"{ip}" site:pastebin.com',
     ],
     "family": [
+        # Removed site:newspapers.com and site:familysearch.org per request
         '"{name}" {surname} {city} {state} obituary',
         '"{name}" {surname} obituary "{relative}"',
         '"{name}" {surname} "mother" OR "father" OR "brother" OR "sister" {city} {state}',
         '"{name}" {surname} marriage license {state}',
-        '"{name}" {surname} site:newspapers.com',
         '"{name}" {surname} site:findagrave.com',
-        '"{name}" {surname} site:familysearch.org',
+        '"{name}" {surname} site:familytreenow.com',
         '"{name}" {surname} genealogy {city} {state}',
     ],
 }
-
-# ---------- Helpers ----------
-def normalize_phone(raw: str) -> str:
-    digits = re.sub(r"\D+", "", raw or "")
-    if not digits:
-        return ""
-    if digits.startswith("1") and len(digits) == 11:
-        return "+" + digits
-    if len(digits) == 10:
-        return "+1" + digits
-    return "+" + digits
-
-def http_check(url: str):
-    try:
-        resp = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=HTTP_TIMEOUT)
-        code = resp.status_code
-        final = resp.url
-        if code >= 400 or code in (403, 405):
-            resp = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=HTTP_TIMEOUT)
-            code = resp.status_code
-            final = resp.url
-        return {"status_code": code, "final_url": final}
-    except Exception as e:
-        return {"error": str(e)}
-
-def exif_from_bytes(data: bytes):
-    try:
-        img = Image.open(BytesIO(data))
-        exif = img.getexif()
-        if not exif:
-            return {}
-        return {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-    except Exception:
-        return {}
-
-def g(q: str) -> str:
-    return f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
-
-def _q(s: str) -> str:
-    return urllib.parse.quote_plus(s or "")
-
-def _dash_name(full_name: str) -> str:
-    return re.sub(r"\s+", "-", (full_name or "").strip())
 
 # ---------- HTML (full template) ----------
 INDEX_HTML = '''
@@ -310,21 +373,49 @@ INDEX_HTML = '''
       }catch(e){ results.innerText = 'Error: '+(e.message||e); }
     };
 
-    document.getElementById('exif-upload-btn').onclick = () => document.getElementById('imgfile').click();
+    // EXIF upload (better errors + meta)
+    document.getElementById('exif-upload-btn').onclick = () => document.getElementById('imgfile').click()
     document.getElementById('imgfile').onchange = async (e)=>{
-      const f = e.target.files[0];
+      const f = e.target.files[0]
       if(!f) return
-      const form = new FormData(); form.append('file', f);
-      results.innerHTML = 'Reading image...';
-      const r = await axios.post('/api/exif', form, {headers: {'Content-Type': 'multipart/form-data'}});
-      let html = '<h6>EXIF</h6>';
-      if(r.data.exif && Object.keys(r.data.exif).length){
-        html += '<ul>';
-        for(const k in r.data.exif){ html += `<li><strong>${k}</strong>: ${r.data.exif[k]}</li>`; }
-        html += '</ul>';
-      } else html += '<div class="text-muted">No EXIF found</div>';
-      results.innerHTML = html;
-    };
+      const form = new FormData(); form.append('file', f)
+      results.innerHTML = 'Reading image...'
+      try{
+        const r = await axios.post('/api/exif', form, {headers: {'Content-Type': 'multipart/form-data'}})
+        let html = '<h6>EXIF</h6>'
+
+        if(r.data.error){
+          html += `<div class="text-danger">Error: ${r.data.error}</div>`
+          results.innerHTML = html
+          return
+        }
+
+        if(r.data.meta){
+          const m = r.data.meta
+          html += `<div class="mb-2"><strong>Format:</strong> ${m.format || '-'} &nbsp; <strong>Size:</strong> ${m.size || '-'} &nbsp; <strong>Mode:</strong> ${m.mode || '-'}</div>`
+        }
+
+        if(r.data.exif && Object.keys(r.data.exif).length){
+          html += '<ul>'
+          for(const k in r.data.exif){
+            const v = r.data.exif[k]
+            if(k === 'GPSDecimal' && v && v.lat !== undefined){
+              html += `<li><strong>GPS (decimal)</strong>: ${v.lat}, ${v.lon}</li>`
+            } else if (typeof v === 'object'){
+              html += `<li><strong>${k}</strong>: <pre class="exif">${JSON.stringify(v, null, 2)}</pre></li>`
+            } else {
+              html += `<li><strong>${k}</strong>: ${v}</li>`
+            }
+          }
+          html += '</ul>'
+        } else {
+          html += '<div class="text-muted">No EXIF found. (Common for PNGs, screenshots, and images saved from social media.) Try an original photo (JPEG/HEIC) straight from the device.</div>'
+        }
+        results.innerHTML = html
+      }catch(err){
+        results.innerHTML = `<div class="text-danger">Error reading EXIF: ${err?.response?.data?.error || err.message}</div>`
+      }
+    }
 
     document.getElementById('export-report').onclick = async ()=>{
       const payload = {
@@ -382,16 +473,18 @@ def api_pivots():
         surname_q = _q(surname)
         kw = _q(" ".join(x for x in [city, state, relative] if x))
         name_dash = _dash_name(name or "")
+        first, last = _split_first_last(name, surname)
         items = []
         for label, tmpl in FAMILY_SITES:
             url = tmpl.format(
                 name_q=name_q, surname_q=surname_q, by=_q(by), dy=_q(dy),
-                kw=kw, city=_q(city), state=_q(state), name_dash=name_dash
+                kw=kw, city=_q(city), state=_q(state), name_dash=name_dash,
+                first=_q(first), last=_q(last)
             )
             items.append({"label": label, "url": url})
         add_section("Family Tree / Genealogy", items)
 
-        # Family-focused Google dorks
+        # Family-focused Google dorks (updated to include FamilyTreeNow; removed FS/Newspapers)
         dorks = []
         for pattern in GOOGLE_DORKS.get("family", []):
             q = pattern.format(name=name, surname=surname, city=city, state=state, relative=relative).strip()
@@ -495,12 +588,17 @@ def api_check_username():
 @app.route('/api/exif', methods=['POST'])
 @require_basic_auth
 def api_exif():
-    if 'file' not in request.files:
-        return jsonify({'error': 'file missing'}), 400
-    f = request.files['file']
-    data = f.read()
-    exif = exif_from_bytes(data)
-    return jsonify({'exif': exif})
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'file missing'}), 400
+        f = request.files['file']
+        data = f.read()
+        if not data:
+            return jsonify({'error': 'empty file'}), 400
+        meta, exif = exif_from_bytes(data)
+        return jsonify({'meta': meta, 'exif': exif})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/report', methods=['POST'])
 @require_basic_auth
